@@ -1037,14 +1037,14 @@ float milligauss_to_tesla(float milligauss)
 int main(int argc, char **argv)
 {
 	ros::init(argc, argv, "IMU_pub");
-	ros::NodeHandle n;
+	ros::NodeHandle n(""), nh_param("~");
   
-	n.param("enable_debug", enable_debug, true);
-	n.param("calibrate_on_start", calibrate_on_start, true);
-	n.param("publish_mag", publish_mag, false);
-	n.param("publish_madgwick", publish_madgwick, false);
-	n.param("publish_tf", publish_tf, false);
-	n.param("publish_temperature", publish_temperature, true); 
+	nh_param.param("enable_debug", enable_debug, false);
+	nh_param.param("calibrate_on_start", calibrate_on_start, false);
+	nh_param.param("publish_mag", publish_mag, false);
+	nh_param.param("publish_madgwick", publish_madgwick, false);
+	nh_param.param("publish_tf", publish_tf, false);
+	nh_param.param("publish_temperature", publish_temperature, false); 
 	
 	ROS_INFO("enable_debug = %s", enable_debug? "True" : "False");
 	//enable_debug = true;
@@ -1116,7 +1116,7 @@ int main(int argc, char **argv)
 		shutdown_node();
 	}
 
-	ros::Rate loop_rate(100); 
+	ros::Rate loop_rate(50); 
 
 	while (ros::ok()){
 	  
