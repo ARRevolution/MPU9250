@@ -1,0 +1,11 @@
+<launch>
+	<node pkg="mpu9250" name="mpu9250_node" type="mpu9250_node">
+		<param name="enable_debug" value="true" />
+		<param name="calibrate_on_start" value="true" />
+		<param name="publish_mag" value="false" />
+		<param name="publish_madgwick" value="false" />
+		<param name="publish_tf" value="false" /> <!-- Use for debug only! -->
+		<param name="publish_temperature" value="true" />
+	</node>	
+
+</launch>

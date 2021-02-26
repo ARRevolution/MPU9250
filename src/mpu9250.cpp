@@ -27,18 +27,29 @@
  We have disabled the internal pull-ups used by the Wire library in the Wire.h/twi.c utility file.
  We are also using the 400 kHz fast I2C mode by setting the TWI_FREQ  to 400000L /twi.h utility file.
  */
-#include <SPI.h>
-#include <Wire.h>   
-#include <Adafruit_GFX.h>
-#include <Adafruit_PCD8544.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <err.h>
+#include <errno.h>
 
-// Using NOKIA 5110 monochrome 84 x 48 pixel display
-// pin 9 - Serial clock out (SCLK)
-// pin 8 - Serial data out (DIN)
-// pin 7 - Data/Command select (D/C)
-// pin 5 - LCD chip select (CS)
-// pin 6 - LCD reset (RST)
-Adafruit_PCD8544 display = Adafruit_PCD8544(9, 8, 7, 5, 6);
+#include <linux/types.h>
+#include <linux/i2c.h>
+#include <linux/i2c-dev.h>
+#include <string>
+#include "std_msgs/String.h"
+#include <sys/ioctl.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+#include "ros/ros.h"
+#include "sensor_msgs/Imu.h"
+#include <sstream>
+#include "sensor_msgs/MagneticField.h"
+#include "sensor_msgs/Temperature.h"
+
+using namespace std; // for string
 
 // See also MPU-9250 Register Map and Descriptions, Revision 4.0, RM-MPU-9250A-00, Rev. 1.4, 9/9/2013 for registers not listed in 
 // above document; the MPU9250 and MPU9150 are virtually identical but the latter has a different register map
@@ -191,7 +202,7 @@ Adafruit_PCD8544 display = Adafruit_PCD8544(9, 8, 7, 5, 6);
 
 // Using the MSENSR-9250 breakout board, ADO is set to 0 
 // Seven-bit device address is 110100 for ADO = 0 and 110101 for ADO = 1
-#define ADO 1
+#define ADO 0
 #if ADO
 #define MPU9250_ADDRESS 0x69  // Device address when ADO = 1
 #else
@@ -200,7 +211,6 @@ Adafruit_PCD8544 display = Adafruit_PCD8544(9, 8, 7, 5, 6);
 #endif  
 
 #define AHRS true         // set to false for basic data read
-#define SerialDebug true   // set to true to get Serial output for debugging
 
 // Set initial input parameters
 enum Ascale {
@@ -243,8 +253,8 @@ float   temperature;    // Stores the real internal chip temperature in degrees 
 float   SelfTest[6];    // holds results of gyro and accelerometer self test
 
 // global constants for 9 DoF fusion and AHRS (Attitude and Heading Reference System)
-float GyroMeasError = PI * (40.0f / 180.0f);   // gyroscope measurement error in rads/s (start at 40 deg/s)
-float GyroMeasDrift = PI * (0.0f  / 180.0f);   // gyroscope measurement drift in rad/s/s (start at 0.0 deg/s/s)
+float GyroMeasError = M_PI * (40.0f / 180.0f);   // gyroscope measurement error in rads/s (start at 40 deg/s)
+float GyroMeasDrift = M_PI * (0.0f  / 180.0f);   // gyroscope measurement drift in rad/s/s (start at 0.0 deg/s/s)
 // There is a tradeoff in the beta parameter between accuracy and response speed.
 // In the original Madgwick study, beta of 0.041 (corresponding to GyroMeasError of 2.7 degrees/s) was found to give optimal accuracy.
 // However, with this value, the LSM9SD0 response time is about 10 seconds to a stable initial quaternion.
@@ -259,331 +269,140 @@ float zeta = sqrt(3.0f / 4.0f) * GyroMeasDrift;   // compute zeta, the other fre
 #define Ki 0.0f
 
 uint32_t delt_t = 0; // used to control display output rate
-uint32_t count = 0, sumCount = 0; // used to control display output rate
+//uint32_t count = 0, sumCount = 0; // used to control display output rate
 float pitch, yaw, roll;
 float deltat = 0.0f, sum = 0.0f;        // integration interval for both filter schemes
 uint32_t lastUpdate = 0, firstUpdate = 0; // used to calculate integration interval
 uint32_t Now = 0;        // used to calculate integration interval
 
-float ax, ay, az, gx, gy, gz, mx, my, mz; // variables to hold latest sensor data values 
+float ax, ay, az, gx, gy, gz, mx, my, mz; // variables to hold latest sensor data values
+float rax, ray, raz, rgx, rgy, rgz, rmx, rmy, rmz; // variables to hold latest sensor data values - in SI units for ROS
 float q[4] = {1.0f, 0.0f, 0.0f, 0.0f};    // vector to hold quaternion
 float eInt[3] = {0.0f, 0.0f, 0.0f};       // vector to hold integral error for Mahony method
 
+// ROS
+ros::Publisher pub_mag;
+ros::Publisher pub_temp;
 
-void setup()
+bool enable_debug;
+bool calibrate_on_start;
+bool publish_mag;
+bool publish_madgwick;
+bool publish_tf;
+bool publish_temperature;
+
+// I2C read write
+//string i2cDeviceName_0 = "/dev/i2c-0";
+string i2cDeviceName_1 = "/dev/i2c-1";
+//int file_i0;
+int file_i1;
+
+static inline __s32 i2c_smbus_access(int file, char read_write, __u8 command, int size, union i2c_smbus_data *data)
 {
-  Wire.begin();
-//  TWBR = 12;  // 400 kbit/sec I2C speed
-  Serial.begin(38400);
-  
-  // Set up the interrupt pin, its set as active high, push-pull
-  pinMode(intPin, INPUT);
-  digitalWrite(intPin, LOW);
-  pinMode(myLed, OUTPUT);
-  digitalWrite(myLed, HIGH);
-  
-  display.begin(); // Ini8ialize the display
-  display.setContrast(58); // Set the contrast
-  
-// Start device display with ID of sensor
-  display.clearDisplay();
-  display.setTextSize(2);
-  display.setCursor(0,0); display.print("MPU9250");
-  display.setTextSize(1);
-  display.setCursor(0, 20); display.print("9-DOF 16-bit");
-  display.setCursor(0, 30); display.print("motion sensor");
-  display.setCursor(20,40); display.print("60 ug LSB");
-  display.display();
-  delay(1000);
+	struct i2c_smbus_ioctl_data args;
 
-// Set up for data display
-  display.setTextSize(1); // Set text size to normal, 2 is twice normal etc.
-  display.setTextColor(BLACK); // Set pixel color; 1 on the monochrome screen
-  display.clearDisplay();   // clears the screen and buffer
-
-  // Read the WHO_AM_I register, this is a good test of communication
-  byte c = readByte(MPU9250_ADDRESS, WHO_AM_I_MPU9250);  // Read WHO_AM_I register for MPU-9250
-  Serial.print("MPU9250 "); Serial.print("I AM "); Serial.print(c, HEX); Serial.print(" I should be "); Serial.println(0x71, HEX);
-  display.setCursor(20,0); display.print("MPU9250");
-  display.setCursor(0,10); display.print("I AM");
-  display.setCursor(0,20); display.print(c, HEX);  
-  display.setCursor(0,30); display.print("I Should Be");
-  display.setCursor(0,40); display.print(0x71, HEX); 
-  display.display();
-  delay(1000); 
-
-  if (c == 0x71) // WHO_AM_I should always be 0x68
-  {  
-    Serial.println("MPU9250 is online...");
-    
-    MPU9250SelfTest(SelfTest); // Start by performing self test and reporting values
-    Serial.print("x-axis self test: acceleration trim within : "); Serial.print(SelfTest[0],1); Serial.println("% of factory value");
-    Serial.print("y-axis self test: acceleration trim within : "); Serial.print(SelfTest[1],1); Serial.println("% of factory value");
-    Serial.print("z-axis self test: acceleration trim within : "); Serial.print(SelfTest[2],1); Serial.println("% of factory value");
-    Serial.print("x-axis self test: gyration trim within : "); Serial.print(SelfTest[3],1); Serial.println("% of factory value");
-    Serial.print("y-axis self test: gyration trim within : "); Serial.print(SelfTest[4],1); Serial.println("% of factory value");
-    Serial.print("z-axis self test: gyration trim within : "); Serial.print(SelfTest[5],1); Serial.println("% of factory value");
- 
-    calibrateMPU9250(gyroBias, accelBias); // Calibrate gyro and accelerometers, load biases in bias registers
-    display.clearDisplay();
-     
-    display.setCursor(0, 0); display.print("MPU9250 bias");
-    display.setCursor(0, 8); display.print(" x   y   z  ");
-
-    display.setCursor(0,  16); display.print((int)(1000*accelBias[0])); 
-    display.setCursor(24, 16); display.print((int)(1000*accelBias[1])); 
-    display.setCursor(48, 16); display.print((int)(1000*accelBias[2])); 
-    display.setCursor(72, 16); display.print("mg");
-    
-    display.setCursor(0,  24); display.print(gyroBias[0], 1); 
-    display.setCursor(24, 24); display.print(gyroBias[1], 1); 
-    display.setCursor(48, 24); display.print(gyroBias[2], 1); 
-    display.setCursor(66, 24); display.print("o/s");   
-  
-    display.display();
-    delay(1000); 
-  
-    initMPU9250(); 
-    Serial.println("MPU9250 initialized for active data mode...."); // Initialize device for active mode read of acclerometer, gyroscope, and temperature
-  
-    // Read the WHO_AM_I register of the magnetometer, this is a good test of communication
-    byte d = readByte(AK8963_ADDRESS, AK8963_WHO_AM_I);  // Read WHO_AM_I register for AK8963
-    Serial.print("AK8963 "); Serial.print("I AM "); Serial.print(d, HEX); Serial.print(" I should be "); Serial.println(0x48, HEX);
-    display.clearDisplay();
-    display.setCursor(20,0); display.print("AK8963");
-    display.setCursor(0,10); display.print("I AM");
-    display.setCursor(0,20); display.print(d, HEX);  
-    display.setCursor(0,30); display.print("I Should Be");
-    display.setCursor(0,40); display.print(0x48, HEX);  
-    display.display();
-    delay(1000); 
-  
-    // Get magnetometer calibration from AK8963 ROM
-    initAK8963(magCalibration); Serial.println("AK8963 initialized for active data mode...."); // Initialize device for active mode read of magnetometer
-  
-  if(SerialDebug) {
-    //  Serial.println("Calibration values: ");
-    Serial.print("X-Axis sensitivity adjustment value "); Serial.println(magCalibration[0], 2);
-    Serial.print("Y-Axis sensitivity adjustment value "); Serial.println(magCalibration[1], 2);
-    Serial.print("Z-Axis sensitivity adjustment value "); Serial.println(magCalibration[2], 2);
-  }
-  
-    display.clearDisplay();
-    display.setCursor(20,0); display.print("AK8963");
-    display.setCursor(0,10); display.print("ASAX "); display.setCursor(50,10); display.print(magCalibration[0], 2);
-    display.setCursor(0,20); display.print("ASAY "); display.setCursor(50,20); display.print(magCalibration[1], 2);
-    display.setCursor(0,30); display.print("ASAZ "); display.setCursor(50,30); display.print(magCalibration[2], 2);
-    display.display();
-    delay(1000);  
-  }
-  else
-  {
-    Serial.print("Could not connect to MPU9250: 0x");
-    Serial.println(c, HEX);
-    while(1) ; // Loop forever if communication doesn't happen
-  }
+	args.read_write = read_write;
+	args.command = command;
+	args.size = size;
+	args.data = data;
+	return ioctl(file, I2C_SMBUS, &args);
 }
 
-void loop()
+static inline __s32 i2c_smbus_read_byte_data(int file, __u8 command)
+{
+	union i2c_smbus_data data;
+	if (i2c_smbus_access(file, I2C_SMBUS_READ, command,	I2C_SMBUS_BYTE_DATA, &data))
+		return -1;
+	else
+		return 0x0FF & data.byte;
+}
+
+static inline __s32 i2c_smbus_write_byte_data(int file, __u8 command, uint8_t data_in)
+{
+	union i2c_smbus_data data;
+	data.byte = data_in;
+	
+	if (i2c_smbus_access(file, I2C_SMBUS_WRITE, command, I2C_SMBUS_BYTE_DATA, &data))
+		return -1;
+	else
+		return 0x0FF & data.byte;
+}
+
+
+        void writeByte(uint8_t dev_addr, uint8_t reg, uint8_t data_in)
+{
+	int rc;
+	uint8_t read_back;
+
+	rc = ioctl(file_i1, I2C_SLAVE, dev_addr); // Sets the device address
+	if (rc < 0)
+	{
+		ROS_INFO("ERROR - couldn't set device address");
+		return;
+	}
+
+	// Actually perform the write and then read back immediately
+	read_back = i2c_smbus_write_byte_data(file_i1, reg, data_in);
+}
+
+        uint8_t readByte(uint8_t dev_addr, uint8_t reg)
+{
+	int rc;
+	uint8_t read_back;
+
+	rc = ioctl(file_i1, I2C_SLAVE, dev_addr); // Sets the device address
+	if (rc < 0)
+	{
+		ROS_INFO("ERROR - couldn't set device address");
+		return false;
+	}
+
+	// Actually perform the write and then read back immediately
+	read_back = i2c_smbus_read_byte_data(file_i1, reg);
+	//ROS_INFO("read_back = 0x%x", read_back);
+	
+	return read_back;
+}
+
+
+        void readBytes(uint8_t dev_addr, uint8_t reg, uint8_t count, uint8_t * dest)
 {  
-  // If intPin goes high, all data registers have new data
-  if (readByte(MPU9250_ADDRESS, INT_STATUS) & 0x01) {  // On interrupt, check if data ready interrupt
-    readAccelData(accelCount);  // Read the x/y/z adc values
-    getAres();
-    
-    // Now we'll calculate the accleration value into actual g's
-    ax = (float)accelCount[0]*aRes; // - accelBias[0];  // get actual g value, this depends on scale being set
-    ay = (float)accelCount[1]*aRes; // - accelBias[1];   
-    az = (float)accelCount[2]*aRes; // - accelBias[2];  
-   
-    readGyroData(gyroCount);  // Read the x/y/z adc values
-    getGres();
- 
-    // Calculate the gyro value into actual degrees per second
-    gx = (float)gyroCount[0]*gRes;  // get actual gyro value, this depends on scale being set
-    gy = (float)gyroCount[1]*gRes;  
-    gz = (float)gyroCount[2]*gRes;   
-  
-    readMagData(magCount);  // Read the x/y/z adc values
-    getMres();
-    magbias[0] = +470.;  // User environmental x-axis correction in milliGauss, should be automatically calculated
-    magbias[1] = +120.;  // User environmental x-axis correction in milliGauss
-    magbias[2] = +125.;  // User environmental x-axis correction in milliGauss
-    
-    // Calculate the magnetometer values in milliGauss
-    // Include factory calibration per data sheet and user environmental corrections
-    mx = (float)magCount[0]*mRes*magCalibration[0] - magbias[0];  // get actual magnetometer value, this depends on scale being set
-    my = (float)magCount[1]*mRes*magCalibration[1] - magbias[1];  
-    mz = (float)magCount[2]*mRes*magCalibration[2] - magbias[2];   
-  }
-  
-  Now = micros();
-  deltat = ((Now - lastUpdate)/1000000.0f); // set integration time by time elapsed since last filter update
-  lastUpdate = Now;
+	int rc;
+	uint8_t read_back;
 
-  sum += deltat; // sum for averaging filter update rate
-  sumCount++;
-  
-  // Sensors x (y)-axis of the accelerometer is aligned with the y (x)-axis of the magnetometer;
-  // the magnetometer z-axis (+ down) is opposite to z-axis (+ up) of accelerometer and gyro!
-  // We have to make some allowance for this orientationmismatch in feeding the output to the quaternion filter.
-  // For the MPU-9250, we have chosen a magnetic rotation that keeps the sensor forward along the x-axis just like
-  // in the LSM9DS0 sensor. This rotation can be modified to allow any convenient orientation convention.
-  // This is ok by aircraft orientation standards!  
-  // Pass gyro rate as rad/s
-//  MadgwickQuaternionUpdate(ax, ay, az, gx*PI/180.0f, gy*PI/180.0f, gz*PI/180.0f,  my,  mx, mz);
-  MahonyQuaternionUpdate(ax, ay, az, gx*PI/180.0f, gy*PI/180.0f, gz*PI/180.0f, my, mx, mz);
-
-
-    if (!AHRS) {
-    delt_t = millis() - count;
-    if(delt_t > 500) {
-
-    if(SerialDebug) {
-    // Print acceleration values in milligs!
-    Serial.print("X-acceleration: "); Serial.print(1000*ax); Serial.print(" mg ");
-    Serial.print("Y-acceleration: "); Serial.print(1000*ay); Serial.print(" mg ");
-    Serial.print("Z-acceleration: "); Serial.print(1000*az); Serial.println(" mg ");
- 
-    // Print gyro values in degree/sec
-    Serial.print("X-gyro rate: "); Serial.print(gx, 3); Serial.print(" degrees/sec "); 
-    Serial.print("Y-gyro rate: "); Serial.print(gy, 3); Serial.print(" degrees/sec "); 
-    Serial.print("Z-gyro rate: "); Serial.print(gz, 3); Serial.println(" degrees/sec"); 
-    
-    // Print mag values in degree/sec
-    Serial.print("X-mag field: "); Serial.print(mx); Serial.print(" mG "); 
-    Serial.print("Y-mag field: "); Serial.print(my); Serial.print(" mG "); 
-    Serial.print("Z-mag field: "); Serial.print(mz); Serial.println(" mG"); 
- 
-    tempCount = readTempData();  // Read the adc values
-    temperature = ((float) tempCount) / 333.87 + 21.0; // Temperature in degrees Centigrade
-   // Print temperature in degrees Centigrade      
-    Serial.print("Temperature is ");  Serial.print(temperature, 1);  Serial.println(" degrees C"); // Print T values to tenths of s degree C
-    }
-    
-    display.clearDisplay();     
-    display.setCursor(0, 0); display.print("MPU9250/AK8963");
-    display.setCursor(0, 8); display.print(" x   y   z  ");
-
-    display.setCursor(0,  16); display.print((int)(1000*ax)); 
-    display.setCursor(24, 16); display.print((int)(1000*ay)); 
-    display.setCursor(48, 16); display.print((int)(1000*az)); 
-    display.setCursor(72, 16); display.print("mg");
-    
-    display.setCursor(0,  24); display.print((int)(gx)); 
-    display.setCursor(24, 24); display.print((int)(gy)); 
-    display.setCursor(48, 24); display.print((int)(gz)); 
-    display.setCursor(66, 24); display.print("o/s");    
-        
-    display.setCursor(0,  32); display.print((int)(mx)); 
-    display.setCursor(24, 32); display.print((int)(my)); 
-    display.setCursor(48, 32); display.print((int)(mz)); 
-    display.setCursor(72, 32); display.print("mG");   
-   
-    display.setCursor(0,  40); display.print("Gyro T "); 
-    display.setCursor(50,  40); display.print(temperature, 1); display.print(" C");
-    display.display();
-    
-    count = millis();
-    digitalWrite(myLed, !digitalRead(myLed));  // toggle led
-    }
-    }
-    else {
-      
-    // Serial print and/or display at 0.5 s rate independent of data rates
-    delt_t = millis() - count;
-    if (delt_t > 500) { // update LCD once per half-second independent of read rate
-
-    if(SerialDebug) {
-    Serial.print("ax = "); Serial.print((int)1000*ax);  
-    Serial.print(" ay = "); Serial.print((int)1000*ay); 
-    Serial.print(" az = "); Serial.print((int)1000*az); Serial.println(" mg");
-    Serial.print("gx = "); Serial.print( gx, 2); 
-    Serial.print(" gy = "); Serial.print( gy, 2); 
-    Serial.print(" gz = "); Serial.print( gz, 2); Serial.println(" deg/s");
-    Serial.print("mx = "); Serial.print( (int)mx ); 
-    Serial.print(" my = "); Serial.print( (int)my ); 
-    Serial.print(" mz = "); Serial.print( (int)mz ); Serial.println(" mG");
-    
-    Serial.print("q0 = "); Serial.print(q[0]);
-    Serial.print(" qx = "); Serial.print(q[1]); 
-    Serial.print(" qy = "); Serial.print(q[2]); 
-    Serial.print(" qz = "); Serial.println(q[3]); 
-    }               
-    
-  // Define output variables from updated quaternion---these are Tait-Bryan angles, commonly used in aircraft orientation.
-  // In this coordinate system, the positive z-axis is down toward Earth. 
-  // Yaw is the angle between Sensor x-axis and Earth magnetic North (or true North if corrected for local declination, looking down on the sensor positive yaw is counterclockwise.
-  // Pitch is angle between sensor x-axis and Earth ground plane, toward the Earth is positive, up toward the sky is negative.
-  // Roll is angle between sensor y-axis and Earth ground plane, y-axis up is positive roll.
-  // These arise from the definition of the homogeneous rotation matrix constructed from quaternions.
-  // Tait-Bryan angles as well as Euler angles are non-commutative; that is, the get the correct orientation the rotations must be
-  // applied in the correct order which for this configuration is yaw, pitch, and then roll.
-  // For more see http://en.wikipedia.org/wiki/Conversion_between_quaternions_and_Euler_angles which has additional links.
-    yaw   = atan2(2.0f * (q[1] * q[2] + q[0] * q[3]), q[0] * q[0] + q[1] * q[1] - q[2] * q[2] - q[3] * q[3]);   
-    pitch = -asin(2.0f * (q[1] * q[3] - q[0] * q[2]));
-    roll  = atan2(2.0f * (q[0] * q[1] + q[2] * q[3]), q[0] * q[0] - q[1] * q[1] - q[2] * q[2] + q[3] * q[3]);
-    pitch *= 180.0f / PI;
-    yaw   *= 180.0f / PI; 
-    yaw   -= 13.8; // Declination at Danville, California is 13 degrees 48 minutes and 47 seconds on 2014-04-04
-    roll  *= 180.0f / PI;
-     
-    if(SerialDebug) {
-    Serial.print("Yaw, Pitch, Roll: ");
-    Serial.print(yaw, 2);
-    Serial.print(", ");
-    Serial.print(pitch, 2);
-    Serial.print(", ");
-    Serial.println(roll, 2);
-    
-    Serial.print("rate = "); Serial.print((float)sumCount/sum, 2); Serial.println(" Hz");
-    }
-   
-    display.clearDisplay();    
- 
-    display.setCursor(0, 0); display.print(" x   y   z  ");
-
-    display.setCursor(0,  8); display.print((int)(1000*ax)); 
-    display.setCursor(24, 8); display.print((int)(1000*ay)); 
-    display.setCursor(48, 8); display.print((int)(1000*az)); 
-    display.setCursor(72, 8); display.print("mg");
-    
-    display.setCursor(0,  16); display.print((int)(gx)); 
-    display.setCursor(24, 16); display.print((int)(gy)); 
-    display.setCursor(48, 16); display.print((int)(gz)); 
-    display.setCursor(66, 16); display.print("o/s");    
-
-    display.setCursor(0,  24); display.print((int)(mx)); 
-    display.setCursor(24, 24); display.print((int)(my)); 
-    display.setCursor(48, 24); display.print((int)(mz)); 
-    display.setCursor(72, 24); display.print("mG");    
- 
-    display.setCursor(0,  32); display.print((int)(yaw)); 
-    display.setCursor(24, 32); display.print((int)(pitch)); 
-    display.setCursor(48, 32); display.print((int)(roll)); 
-    display.setCursor(66, 32); display.print("ypr");  
-  
-    // With these settings the filter is updating at a ~145 Hz rate using the Madgwick scheme and 
-    // >200 Hz using the Mahony scheme even though the display refreshes at only 2 Hz.
-    // The filter update rate is determined mostly by the mathematical steps in the respective algorithms, 
-    // the processor speed (8 MHz for the 3.3V Pro Mini), and the magnetometer ODR:
-    // an ODR of 10 Hz for the magnetometer produce the above rates, maximum magnetometer ODR of 100 Hz produces
-    // filter update rates of 36 - 145 and ~38 Hz for the Madgwick and Mahony schemes, respectively. 
-    // This is presumably because the magnetometer read takes longer than the gyro or accelerometer reads.
-    // This filter update rate should be fast enough to maintain accurate platform orientation for 
-    // stabilization control of a fast-moving robot or quadcopter. Compare to the update rate of 200 Hz
-    // produced by the on-board Digital Motion Processor of Invensense's MPU6050 6 DoF and MPU9150 9DoF sensors.
-    // The 3.3 V 8 MHz Pro Mini is doing pretty well!
-    display.setCursor(0, 40); display.print("rt: "); display.print((float) sumCount / sum, 2); display.print(" Hz"); 
-    display.display();
-
-    count = millis(); 
-    sumCount = 0;
-    sum = 0;    
-    }
-    }
-
+	rc = ioctl(file_i1, I2C_SLAVE, dev_addr); // Sets the device address
+	if (rc < 0)
+	{
+		ROS_INFO("ERROR - couldn't set device address");
+		return;
+	}
+	
+	struct i2c_smbus_ioctl_data ioctl_data;
+	union i2c_smbus_data smbus_data;
+	
+	smbus_data.block[0] = count;
+	ioctl_data.read_write = I2C_SMBUS_READ;
+    ioctl_data.command = reg;
+    ioctl_data.size = I2C_SMBUS_I2C_BLOCK_DATA;
+    ioctl_data.data = &smbus_data;
+	
+	if (ioctl (file_i1, I2C_SMBUS, &ioctl_data))
+		ROS_INFO("ERROR - Block read fail");
+	else
+		for (uint8_t i = 0; i < count; i++)
+			dest[0] = 0x0FF & smbus_data.block[i+1];
 }
+
+void delay(int time_ms)
+{
+	ros::Duration(time_ms/1000).sleep();
+}
+
+void shutdown_node()
+{
+	ROS_INFO("Shutting Down...");
+	ros::waitForShutdown();
+}  
 
 //===================================================================================================================
 //====== Set of useful function to access acceleration. gyroscope, magnetometer, and temperature data
@@ -1002,34 +821,487 @@ void MPU9250SelfTest(float * destination) // Should return percent deviation fro
    
 }
 
-        
-        // Wire.h read and write protocols
-        void writeByte(uint8_t address, uint8_t subAddress, uint8_t data)
+// Implementation of Sebastian Madgwick's "...efficient orientation filter for... inertial/magnetic sensor arrays"
+// (see http://www.x-io.co.uk/category/open-source/ for examples and more details)
+// which fuses acceleration, rotation rate, and magnetic moments to produce a quaternion-based estimate of absolute
+// device orientation -- which can be converted to yaw, pitch, and roll. Useful for stabilizing quadcopters, etc.
+// The performance of the orientation filter is at least as good as conventional Kalman-based filtering algorithms
+// but is much less computationally intensive---it can be performed on a 3.3 V Pro Mini operating at 8 MHz!
+        void MadgwickQuaternionUpdate(float ax, float ay, float az, float gx, float gy, float gz, float mx, float my, float mz)
+        {
+            float q1 = q[0], q2 = q[1], q3 = q[2], q4 = q[3];   // short name local variable for readability
+            float norm;
+            float hx, hy, _2bx, _2bz;
+            float s1, s2, s3, s4;
+            float qDot1, qDot2, qDot3, qDot4;
+
+            // Auxiliary variables to avoid repeated arithmetic
+            float _2q1mx;
+            float _2q1my;
+            float _2q1mz;
+            float _2q2mx;
+            float _4bx;
+            float _4bz;
+            float _2q1 = 2.0f * q1;
+            float _2q2 = 2.0f * q2;
+            float _2q3 = 2.0f * q3;
+            float _2q4 = 2.0f * q4;
+            float _2q1q3 = 2.0f * q1 * q3;
+            float _2q3q4 = 2.0f * q3 * q4;
+            float q1q1 = q1 * q1;
+            float q1q2 = q1 * q2;
+            float q1q3 = q1 * q3;
+            float q1q4 = q1 * q4;
+            float q2q2 = q2 * q2;
+            float q2q3 = q2 * q3;
+            float q2q4 = q2 * q4;
+            float q3q3 = q3 * q3;
+            float q3q4 = q3 * q4;
+            float q4q4 = q4 * q4;
+
+            // Normalise accelerometer measurement
+            norm = sqrtf(ax * ax + ay * ay + az * az);
+            if (norm == 0.0f) return; // handle NaN
+            norm = 1.0f/norm;
+            ax *= norm;
+            ay *= norm;
+            az *= norm;
+
+            // Normalise magnetometer measurement
+            norm = sqrtf(mx * mx + my * my + mz * mz);
+            if (norm == 0.0f) return; // handle NaN
+            norm = 1.0f/norm;
+            mx *= norm;
+            my *= norm;
+            mz *= norm;
+
+            // Reference direction of Earth's magnetic field
+            _2q1mx = 2.0f * q1 * mx;
+            _2q1my = 2.0f * q1 * my;
+            _2q1mz = 2.0f * q1 * mz;
+            _2q2mx = 2.0f * q2 * mx;
+            hx = mx * q1q1 - _2q1my * q4 + _2q1mz * q3 + mx * q2q2 + _2q2 * my * q3 + _2q2 * mz * q4 - mx * q3q3 - mx * q4q4;
+            hy = _2q1mx * q4 + my * q1q1 - _2q1mz * q2 + _2q2mx * q3 - my * q2q2 + my * q3q3 + _2q3 * mz * q4 - my * q4q4;
+            _2bx = sqrtf(hx * hx + hy * hy);
+            _2bz = -_2q1mx * q3 + _2q1my * q2 + mz * q1q1 + _2q2mx * q4 - mz * q2q2 + _2q3 * my * q4 - mz * q3q3 + mz * q4q4;
+            _4bx = 2.0f * _2bx;
+            _4bz = 2.0f * _2bz;
+
+            // Gradient decent algorithm corrective step
+            s1 = -_2q3 * (2.0f * q2q4 - _2q1q3 - ax) + _2q2 * (2.0f * q1q2 + _2q3q4 - ay) - _2bz * q3 * (_2bx * (0.5f - q3q3 - q4q4) + _2bz * (q2q4 - q1q3) - mx) + (-_2bx * q4 + _2bz * q2) * (_2bx * (q2q3 - q1q4) + _2bz * (q1q2 + q3q4) - my) + _2bx * q3 * (_2bx * (q1q3 + q2q4) + _2bz * (0.5f - q2q2 - q3q3) - mz);
+            s2 = _2q4 * (2.0f * q2q4 - _2q1q3 - ax) + _2q1 * (2.0f * q1q2 + _2q3q4 - ay) - 4.0f * q2 * (1.0f - 2.0f * q2q2 - 2.0f * q3q3 - az) + _2bz * q4 * (_2bx * (0.5f - q3q3 - q4q4) + _2bz * (q2q4 - q1q3) - mx) + (_2bx * q3 + _2bz * q1) * (_2bx * (q2q3 - q1q4) + _2bz * (q1q2 + q3q4) - my) + (_2bx * q4 - _4bz * q2) * (_2bx * (q1q3 + q2q4) + _2bz * (0.5f - q2q2 - q3q3) - mz);
+            s3 = -_2q1 * (2.0f * q2q4 - _2q1q3 - ax) + _2q4 * (2.0f * q1q2 + _2q3q4 - ay) - 4.0f * q3 * (1.0f - 2.0f * q2q2 - 2.0f * q3q3 - az) + (-_4bx * q3 - _2bz * q1) * (_2bx * (0.5f - q3q3 - q4q4) + _2bz * (q2q4 - q1q3) - mx) + (_2bx * q2 + _2bz * q4) * (_2bx * (q2q3 - q1q4) + _2bz * (q1q2 + q3q4) - my) + (_2bx * q1 - _4bz * q3) * (_2bx * (q1q3 + q2q4) + _2bz * (0.5f - q2q2 - q3q3) - mz);
+            s4 = _2q2 * (2.0f * q2q4 - _2q1q3 - ax) + _2q3 * (2.0f * q1q2 + _2q3q4 - ay) + (-_4bx * q4 + _2bz * q2) * (_2bx * (0.5f - q3q3 - q4q4) + _2bz * (q2q4 - q1q3) - mx) + (-_2bx * q1 + _2bz * q3) * (_2bx * (q2q3 - q1q4) + _2bz * (q1q2 + q3q4) - my) + _2bx * q2 * (_2bx * (q1q3 + q2q4) + _2bz * (0.5f - q2q2 - q3q3) - mz);
+            norm = sqrtf(s1 * s1 + s2 * s2 + s3 * s3 + s4 * s4);    // normalise step magnitude
+            norm = 1.0f/norm;
+            s1 *= norm;
+            s2 *= norm;
+            s3 *= norm;
+            s4 *= norm;
+
+            // Compute rate of change of quaternion
+            qDot1 = 0.5f * (-q2 * gx - q3 * gy - q4 * gz) - beta * s1;
+            qDot2 = 0.5f * (q1 * gx + q3 * gz - q4 * gy) - beta * s2;
+            qDot3 = 0.5f * (q1 * gy - q2 * gz + q4 * gx) - beta * s3;
+            qDot4 = 0.5f * (q1 * gz + q2 * gy - q3 * gx) - beta * s4;
+
+            // Integrate to yield quaternion
+            q1 += qDot1 * deltat;
+            q2 += qDot2 * deltat;
+            q3 += qDot3 * deltat;
+            q4 += qDot4 * deltat;
+            norm = sqrtf(q1 * q1 + q2 * q2 + q3 * q3 + q4 * q4);    // normalise quaternion
+            norm = 1.0f/norm;
+            q[0] = q1 * norm;
+            q[1] = q2 * norm;
+            q[2] = q3 * norm;
+            q[3] = q4 * norm;
+
+        }
+  
+  
+  
+ // Similar to Madgwick scheme but uses proportional and integral filtering on the error between estimated reference vectors and
+ // measured ones. 
+            void MahonyQuaternionUpdate(float ax, float ay, float az, float gx, float gy, float gz, float mx, float my, float mz)
+        {
+            float q1 = q[0], q2 = q[1], q3 = q[2], q4 = q[3];   // short name local variable for readability
+            float norm;
+            float hx, hy, bx, bz;
+            float vx, vy, vz, wx, wy, wz;
+            float ex, ey, ez;
+            float pa, pb, pc;
+
+            // Auxiliary variables to avoid repeated arithmetic
+            float q1q1 = q1 * q1;
+            float q1q2 = q1 * q2;
+            float q1q3 = q1 * q3;
+            float q1q4 = q1 * q4;
+            float q2q2 = q2 * q2;
+            float q2q3 = q2 * q3;
+            float q2q4 = q2 * q4;
+            float q3q3 = q3 * q3;
+            float q3q4 = q3 * q4;
+            float q4q4 = q4 * q4;   
+
+            // Normalise accelerometer measurement
+            norm = sqrtf(ax * ax + ay * ay + az * az);
+            if (norm == 0.0f) return; // handle NaN
+            norm = 1.0f / norm;        // use reciprocal for division
+            ax *= norm;
+            ay *= norm;
+            az *= norm;
+
+            // Normalise magnetometer measurement
+            norm = sqrtf(mx * mx + my * my + mz * mz);
+            if (norm == 0.0f) return; // handle NaN
+            norm = 1.0f / norm;        // use reciprocal for division
+            mx *= norm;
+            my *= norm;
+            mz *= norm;
+
+            // Reference direction of Earth's magnetic field
+            hx = 2.0f * mx * (0.5f - q3q3 - q4q4) + 2.0f * my * (q2q3 - q1q4) + 2.0f * mz * (q2q4 + q1q3);
+            hy = 2.0f * mx * (q2q3 + q1q4) + 2.0f * my * (0.5f - q2q2 - q4q4) + 2.0f * mz * (q3q4 - q1q2);
+            bx = sqrtf((hx * hx) + (hy * hy));
+            bz = 2.0f * mx * (q2q4 - q1q3) + 2.0f * my * (q3q4 + q1q2) + 2.0f * mz * (0.5f - q2q2 - q3q3);
+
+            // Estimated direction of gravity and magnetic field
+            vx = 2.0f * (q2q4 - q1q3);
+            vy = 2.0f * (q1q2 + q3q4);
+            vz = q1q1 - q2q2 - q3q3 + q4q4;
+            wx = 2.0f * bx * (0.5f - q3q3 - q4q4) + 2.0f * bz * (q2q4 - q1q3);
+            wy = 2.0f * bx * (q2q3 - q1q4) + 2.0f * bz * (q1q2 + q3q4);
+            wz = 2.0f * bx * (q1q3 + q2q4) + 2.0f * bz * (0.5f - q2q2 - q3q3);  
+
+            // Error is cross product between estimated direction and measured direction of gravity
+            ex = (ay * vz - az * vy) + (my * wz - mz * wy);
+            ey = (az * vx - ax * vz) + (mz * wx - mx * wz);
+            ez = (ax * vy - ay * vx) + (mx * wy - my * wx);
+            if (Ki > 0.0f)
+            {
+                eInt[0] += ex;      // accumulate integral error
+                eInt[1] += ey;
+                eInt[2] += ez;
+            }
+            else
+            {
+                eInt[0] = 0.0f;     // prevent integral wind up
+                eInt[1] = 0.0f;
+                eInt[2] = 0.0f;
+            }
+
+            // Apply feedback terms
+            gx = gx + Kp * ex + Ki * eInt[0];
+            gy = gy + Kp * ey + Ki * eInt[1];
+            gz = gz + Kp * ez + Ki * eInt[2];
+
+            // Integrate rate of change of quaternion
+            pa = q2;
+            pb = q3;
+            pc = q4;
+            q1 = q1 + (-q2 * gx - q3 * gy - q4 * gz) * (0.5f * deltat);
+            q2 = pa + (q1 * gx + pb * gz - pc * gy) * (0.5f * deltat);
+            q3 = pb + (q1 * gy - pa * gz + pc * gx) * (0.5f * deltat);
+            q4 = pc + (q1 * gz + pa * gy - pb * gx) * (0.5f * deltat);
+
+            // Normalise quaternion
+            norm = sqrtf(q1 * q1 + q2 * q2 + q3 * q3 + q4 * q4);
+            norm = 1.0f / norm;
+            q[0] = q1 * norm;
+            q[1] = q2 * norm;
+            q[2] = q3 * norm;
+            q[3] = q4 * norm;
+ 
+        }
+
+// Unit conversions
+float milligals_to_m_per_s(float gals)
 {
-	Wire.beginTransmission(address);  // Initialize the Tx buffer
-	Wire.write(subAddress);           // Put slave register address in Tx buffer
-	Wire.write(data);                 // Put data in Tx buffer
-	Wire.endTransmission();           // Send the Tx buffer
+	// 100,000 Milligals = 1 m/s2
+	return (gals / 100);
 }
 
-        uint8_t readByte(uint8_t address, uint8_t subAddress)
+float degs_to_rads(float degs)
 {
-	uint8_t data; // `data` will store the register data	 
-	Wire.beginTransmission(address);         // Initialize the Tx buffer
-	Wire.write(subAddress);	                 // Put slave register address in Tx buffer
-	Wire.endTransmission(false);             // Send the Tx buffer, but send a restart to keep connection alive
-	Wire.requestFrom(address, (uint8_t) 1);  // Read one byte from slave register address 
-	data = Wire.read();                      // Fill Rx buffer with result
-	return data;                             // Return data read from slave register
+	// 57.2958 degrees = 1 rad
+	return (degs / 57.2958);
 }
 
-        void readBytes(uint8_t address, uint8_t subAddress, uint8_t count, uint8_t * dest)
-{  
-	Wire.beginTransmission(address);   // Initialize the Tx buffer
-	Wire.write(subAddress);            // Put slave register address in Tx buffer
-	Wire.endTransmission(false);       // Send the Tx buffer, but send a restart to keep connection alive
-	uint8_t i = 0;
-        Wire.requestFrom(address, count);  // Read bytes from slave register address 
-	while (Wire.available()) {
-        dest[i++] = Wire.read(); }         // Put read results in the Rx buffer
+float milligauss_to_tesla(float milligauss)
+{
+	// 10,000,000 Milligauss = 1 Tesla
+	return (milligauss / 10000000);
 }
+
+int main(int argc, char **argv)
+{
+	ros::init(argc, argv, "IMU_pub");
+	ros::NodeHandle n;
+  
+	n.param("enable_debug", enable_debug, true);
+	n.param("calibrate_on_start", calibrate_on_start, true);
+	n.param("publish_mag", publish_mag, false);
+	n.param("publish_madgwick", publish_madgwick, false);
+	n.param("publish_tf", publish_tf, false);
+	n.param("publish_temperature", publish_temperature, true); 
+	
+	ROS_INFO("enable_debug = %s", enable_debug? "True" : "False");
+	//enable_debug = true;
+  
+	ros::Publisher pub_imu = n.advertise<sensor_msgs::Imu>("imu/data_raw", 2);
+  
+	if (publish_mag)
+		pub_mag = n.advertise<sensor_msgs::MagneticField>("imu/mag", 2);
+
+	if (publish_temperature)
+		pub_temp = n.advertise<sensor_msgs::Temperature>("imu/temp", 2);
+
+	// I2C
+	file_i1 = open(i2cDeviceName_1.c_str(), O_RDWR);
+	if (file_i1 < 0)
+		ROS_INFO("ERROR - i2c 0 file not open!");
+  
+	// *todo - Required? Seem to be reading the IRQ pin status via I2C
+	// Set up the interrupt pin, its set as active high, push-pull
+	//pinMode(intPin, INPUT);
+	//digitalWrite(intPin, LOW);
+    
+	// Read the WHO_AM_I register, this is a good test of communication
+	char c = readByte(MPU9250_ADDRESS, WHO_AM_I_MPU9250);  // Read WHO_AM_I register for MPU-9250
+	ROS_INFO("MPU9250 - I am 0x%x - I should be 0x71", c);
+
+	if (c == 0x71) // WHO_AM_I should always be 0x68
+	{  
+		ROS_INFO("MPU9250 is online...");
+		
+		MPU9250SelfTest(SelfTest); // Start by performing self test and reporting values
+		ROS_INFO("x-axis self test: acceleration trim within : %.1f%% of factory value", SelfTest[0]);
+		ROS_INFO("y-axis self test: acceleration trim within : %.1f%% of factory value", SelfTest[1]);
+		ROS_INFO("z-axis self test: acceleration trim within : %.1f%% of factory value", SelfTest[2]);
+		ROS_INFO("x-axis self test: gyration trim within : %.1f%% of factory value", SelfTest[3]);
+		ROS_INFO("y-axis self test: gyration trim within : %.1f%% of factory value", SelfTest[4]);
+		ROS_INFO("z-axis self test: gyration trim within : %.1f%% of factory value", SelfTest[5]);
+	 
+		if (calibrate_on_start)
+			calibrateMPU9250(gyroBias, accelBias); // Calibrate gyro and accelerometers, load biases in bias registers
+		
+		//delay(1000)
+		
+		initMPU9250(); 
+		ROS_INFO("MPU9250 initialized for active data mode...."); // Initialize device for active mode read of acclerometer, gyroscope, and temperature
+	  
+		// Read the WHO_AM_I register of the magnetometer, this is a good test of communication
+		char d = readByte(AK8963_ADDRESS, AK8963_WHO_AM_I);  // Read WHO_AM_I register for AK8963
+		ROS_INFO("MPU9250 - I am 0x%x - I should be 0x48", d);
+
+		//delay(1000); 
+	  
+		// Get magnetometer calibration from AK8963 ROM
+		initAK8963(magCalibration); 
+		ROS_INFO("AK8963 initialized for active data mode...."); // Initialize device for active mode read of magnetometer
+	  
+		if(enable_debug) {
+			//  Serial.println("Calibration values: ");
+			ROS_INFO("X-Axis sensitivity adjustment value %.2f", magCalibration[0]);
+			ROS_INFO("Y-Axis sensitivity adjustment value %.2f", magCalibration[1]);
+			ROS_INFO("Z-Axis sensitivity adjustment value %.2f", magCalibration[2]);
+		}
+
+    //delay(1000);  
+	}
+	else
+	{
+		ROS_INFO("Could not connect to MPU9250: 0x%x", c);
+		shutdown_node();
+	}
+
+	ros::Rate loop_rate(100); 
+
+	while (ros::ok()){
+	  
+		// If intPin goes high, all data registers have new data
+		if (readByte(MPU9250_ADDRESS, INT_STATUS) & 0x01) {  // On interrupt, check if data ready interrupt
+			readAccelData(accelCount);  // Read the x/y/z adc values
+			getAres();
+			
+			// Now we'll calculate the accleration value into actual g's
+			ax = (float)accelCount[0]*aRes; // - accelBias[0];  // get actual g value, this depends on scale being set
+			ay = (float)accelCount[1]*aRes; // - accelBias[1];   
+			az = (float)accelCount[2]*aRes; // - accelBias[2];  
+		   
+			readGyroData(gyroCount);  // Read the x/y/z adc values
+			getGres();
+		 
+			// Calculate the gyro value into actual degrees per second
+			gx = (float)gyroCount[0]*gRes;  // get actual gyro value, this depends on scale being set
+			gy = (float)gyroCount[1]*gRes;  
+			gz = (float)gyroCount[2]*gRes;   
+		  
+			readMagData(magCount);  // Read the x/y/z adc values
+			getMres();
+			// todo - calculate/measure your own biases
+			magbias[0] = 0; //+470.;  // User environmental x-axis correction in milliGauss, should be automatically calculated
+			magbias[1] = 0; //+120.;  // User environmental y-axis correction in milliGauss
+			magbias[2] = 0; //+125.;  // User environmental z-axis correction in milliGauss
+			
+			// Calculate the magnetometer values in milliGauss
+			// Include factory calibration per data sheet and user environmental corrections
+			mx = (float)magCount[0]*mRes*magCalibration[0] - magbias[0];  // get actual magnetometer value, this depends on scale being set
+			my = (float)magCount[1]*mRes*magCalibration[1] - magbias[1];  
+			mz = (float)magCount[2]*mRes*magCalibration[2] - magbias[2];  
+
+			// Convert to SI for ROS
+			rax = milligals_to_m_per_s(ax);
+			ray = milligals_to_m_per_s(ay);  
+			raz = milligals_to_m_per_s(az);
+			
+			rgx = degs_to_rads(gx);
+			rgy = degs_to_rads(gy); 
+			rgz = degs_to_rads(gz);
+			
+			rmx = milligauss_to_tesla(mx);
+			rmy = milligauss_to_tesla(my); 
+			rmz = milligauss_to_tesla(mz);			
+		}
+  
+		//ros::Time now_time = ros::Time::now().toSec() * 1000;
+		//elapsed_time_ = ros::Duration(now_time - last_time);
+		//last_time = now_time;
+  
+		// *Todo - Needs checking this overflows/loops correctly
+		Now = (uint32_t)(ros::Time::now().toSec() * 1000); //micros();
+		deltat = ((Now - lastUpdate)/1000000.0f); // set integration time by time elapsed since last filter update
+		lastUpdate = Now;
+		sum += deltat; // sum for averaging filter update rate
+
+		// Sensors x (y)-axis of the accelerometer is aligned with the y (x)-axis of the magnetometer;
+		// the magnetometer z-axis (+ down) is opposite to z-axis (+ up) of accelerometer and gyro!
+		// We have to make some allowance for this orientationmismatch in feeding the output to the quaternion filter.
+		// For the MPU-9250, we have chosen a magnetic rotation that keeps the sensor forward along the x-axis just like
+		// in the LSM9DS0 sensor. This rotation can be modified to allow any convenient orientation convention.
+		// This is ok by aircraft orientation standards!  
+		// Pass gyro rate as rad/s
+		if (publish_madgwick || publish_tf)
+		{
+			//  MadgwickQuaternionUpdate(ax, ay, az, gx*M_PI/180.0f, gy*M_PI/180.0f, gz*M_PI/180.0f,  my,  mx, mz);
+			MahonyQuaternionUpdate(ax, ay, az, gx*M_PI/180.0f, gy*M_PI/180.0f, gz*M_PI/180.0f, my, mx, mz);
+		}
+
+		if(enable_debug) {
+			// 100,000 Milligals = 1 m/s2
+			ROS_INFO("ax = %d mG - %.3f m/s2", (int)(1000*ax), rax);
+			ROS_INFO("ay = %d mG - %.3f m/s2", (int)(1000*ay), ray); 
+			ROS_INFO("az = %d mG - %.3f m/s2", (int)(1000*az), raz);
+			
+			// deg/s - rad/s
+			ROS_INFO(" gx = %.2f deg/s - %.3f rad/s",  gx, rgx); 
+			ROS_INFO(" gy = %.2f deg/s - %.3f rad/s",  gy, rgy); 
+			ROS_INFO(" gz = %.2f deg/s - %.3f rad/s",  gz, rgz);
+			
+			// 10,000,000 Milligauss = 1 Tesla
+			ROS_INFO("mx = %d mG - %.5f T",  (int)mx, rmx); 
+			ROS_INFO("my = %d mG - %.5f T",  (int)my, rmy); 
+			ROS_INFO("mz = %d mG - %.5f T",  (int)mz, rmz);
+			
+			// Orientation
+			if (publish_madgwick || publish_tf)
+			{
+				ROS_INFO(" q0 = %f", q[0]);
+				ROS_INFO(" qx = %f", q[1]); 
+				ROS_INFO(" qy = %f", q[2]); 
+				ROS_INFO(" qz = %f", q[3]); 
+			}
+			
+			ROS_INFO("  ");
+		}               	
+
+		sensor_msgs::Imu data_imu;
+		data_imu.header.stamp = ros::Time::now();
+    
+		if (publish_tf)
+		{
+			// Define output variables from updated quaternion---these are Tait-Bryan angles, commonly used in aircraft orientation.
+			// In this coordinate system, the positive z-axis is down toward Earth. 
+			// Yaw is the angle between Sensor x-axis and Earth magnetic North (or true North if corrected for local declination, looking down on the sensor positive yaw is counterclockwise.
+			// Pitch is angle between sensor x-axis and Earth ground plane, toward the Earth is positive, up toward the sky is negative.
+			// Roll is angle between sensor y-axis and Earth ground plane, y-axis up is positive roll.
+			// These arise from the definition of the homogeneous rotation matrix constructed from quaternions.
+			// Tait-Bryan angles as well as Euler angles are non-commutative; that is, the get the correct orientation the rotations must be
+			// applied in the correct order which for this configuration is yaw, pitch, and then roll.
+			// For more see http://en.wikipedia.org/wiki/Conversion_between_quaternions_and_Euler_angles which has additional links.
+			yaw   = atan2(2.0f * (q[1] * q[2] + q[0] * q[3]), q[0] * q[0] + q[1] * q[1] - q[2] * q[2] - q[3] * q[3]);   
+			pitch = -asin(2.0f * (q[1] * q[3] - q[0] * q[2]));
+			roll  = atan2(2.0f * (q[0] * q[1] + q[2] * q[3]), q[0] * q[0] - q[1] * q[1] - q[2] * q[2] + q[3] * q[3]);
+			pitch *= 180.0f / M_PI;
+			yaw   *= 180.0f / M_PI; 
+			//yaw   -= 13.8; // Declination at Danville, California is 13 degrees 48 minutes and 47 seconds on 2014-04-04
+			// My location is basically 0 declination - https://www.magnetic-declination.com/
+			roll  *= 180.0f / M_PI;
+			 
+			if (enable_debug) {
+				ROS_INFO("Yaw - %.2f, Pitch - %.2f, Roll - %.2f: ", yaw, pitch, roll);
+				ROS_INFO("  ");
+			}
+			
+			//data_mag.header.stamp = 
+			
+		}
+		sum = 0;    
+
+
+		data_imu.header.frame_id = "imu_link";
+		data_imu.linear_acceleration.x = rax;
+		data_imu.linear_acceleration.y = ray;
+		data_imu.linear_acceleration.z = raz;
+	
+	    data_imu.angular_velocity.x = rgx;
+		data_imu.angular_velocity.y = rgy;
+		data_imu.angular_velocity.z = rgz;
+		
+		if (publish_madgwick)
+		{
+			data_imu.orientation.w = q[0];
+			data_imu.orientation.x = q[1];
+			data_imu.orientation.y = q[2];
+			data_imu.orientation.z = q[3];
+		}	
+	
+		pub_imu.publish(data_imu);		
+
+
+		if (publish_mag)
+		{
+			sensor_msgs::MagneticField data_mag;
+			data_mag.header.stamp = data_imu.header.stamp;
+			data_mag.header.frame_id = "imu_link";
+			data_mag.magnetic_field.x = rmx;
+			data_mag.magnetic_field.y = rmy;
+			data_mag.magnetic_field.z = rmz;
+			
+			pub_mag.publish(data_mag);
+		}
+		
+		if (publish_temperature)
+		{	
+			tempCount = readTempData();  // Read the adc values
+			temperature = ((float)tempCount) / 333.87 + 21.0; // Temperature in degrees Centigrade
+
+			if (enable_debug)
+				ROS_INFO("Temperature is %.1f degrees C", temperature); // Print T values to tenths of s degree C
+
+			sensor_msgs::Temperature data_temp;
+			data_temp.header.stamp = data_imu.header.stamp;
+			data_temp.header.frame_id = "imu_link";
+			data_temp.temperature = temperature;
+			data_temp.variance = 0;
+			
+			pub_temp.publish(data_temp);
+		}
+			
+		
+
+		ros::spinOnce();
+		loop_rate.sleep();
+	} // loop
+} // main
